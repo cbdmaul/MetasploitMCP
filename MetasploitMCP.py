@@ -18,10 +18,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from mcp.server.fastmcp import FastMCP
 from pymetasploit3.msfrpc import MsfConsole, MsfRpcClient, MsfRpcError
 
+# Import console utilities
+from console_utils import get_msf_console, run_command_safely, set_msf_client
+from console_helpers import show_module_options_via_console, execute_module_console, execute_module_rpc
+from utils import parse_options_gracefully
+
 # --- Configuration & Constants ---
 
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    level=os.environ.get("LOG_LEVEL", "DEBUG").upper(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("metasploit_mcp_server")
@@ -83,6 +88,8 @@ def initialize_msf_client() -> MsfRpcClient:
         msf_version = version_info.get('version', 'unknown') if isinstance(version_info, dict) else 'unknown'
         logger.info(f"Successfully connected to Metasploit RPC at {MSF_SERVER}:{msf_port} (SSL: {msf_ssl}), version: {msf_version}")
         _msf_client_instance = client
+        # Also set the client in console_utils
+        set_msf_client(client)
         return _msf_client_instance
     except MsfRpcError as e:
         logger.error(f"Failed to connect or authenticate to Metasploit RPC ({MSF_SERVER}:{msf_port}, SSL: {msf_ssl}): {e}")
@@ -149,210 +156,6 @@ async def check_msf_connection() -> Dict[str, Any]:
             "message": f"Unexpected error: {e}"
         }
 
-@contextlib.asynccontextmanager
-async def get_msf_console() -> MsfConsole:
-    """
-    Async context manager for creating and reliably destroying an MSF console.
-    """
-    client = get_msf_client() # Raises ConnectionError if not initialized
-    console_object: Optional[MsfConsole] = None
-    console_id_str: Optional[str] = None
-    try:
-        logger.debug("Creating temporary MSF console...")
-        # Create console object directly
-        console_object = await asyncio.to_thread(lambda: client.consoles.console())
-
-        # Get ID using .cid attribute
-        if isinstance(console_object, MsfConsole) and hasattr(console_object, 'cid'):
-            console_id_val = getattr(console_object, 'cid')
-            console_id_str = str(console_id_val) if console_id_val is not None else None
-            if not console_id_str:
-                raise ValueError("Console object created, but .cid attribute is empty or None.")
-            logger.info(f"MSF console created (ID: {console_id_str})")
-
-            # Read initial prompt/banner to clear buffer and ensure readiness
-            await asyncio.sleep(0.2) # Short delay for prompt to appear
-            initial_read = await asyncio.to_thread(lambda: console_object.read())
-            logger.debug(f"Initial console read (clearing buffer): {initial_read}")
-            yield console_object # Yield the ready console object
-        else:
-            # This case should ideally not happen if .console() works as expected
-            logger.error(f"client.consoles.console() did not return expected MsfConsole object with .cid. Got type: {type(console_object)}")
-            raise MsfRpcError(f"Unexpected result from console creation: {console_object}")
-
-    except MsfRpcError as e:
-        logger.error(f"MsfRpcError during console operation: {e}")
-        raise MsfRpcError(f"Error creating/accessing MSF console: {e}") from e
-    except Exception as e:
-        logger.exception("Unexpected error during console creation/setup")
-        raise RuntimeError(f"Unexpected error during console operation: {e}") from e
-    finally:
-        # Destruction Logic
-        if console_id_str and _msf_client_instance: # Check client still exists
-            try:
-                logger.info(f"Attempting to destroy Metasploit console (ID: {console_id_str})...")
-                # Use lambda to avoid potential issues with capture
-                destroy_result = await asyncio.to_thread(
-                    lambda cid=console_id_str: _msf_client_instance.consoles.destroy(cid)
-                )
-                logger.debug(f"Console destroy result: {destroy_result}")
-            except Exception as e:
-                # Log error but don't raise exception during cleanup
-                logger.error(f"Error destroying MSF console {console_id_str}: {e}")
-        elif console_object and not console_id_str:
-             logger.warning("Console object created but no valid ID obtained, cannot explicitly destroy.")
-        # else: logger.debug("No console ID obtained, skipping destruction.")
-
-async def run_command_safely(console: MsfConsole, cmd: str, execution_timeout: Optional[int] = None) -> str:
-    """
-    Safely run a command on a Metasploit console and return the output.
-    Relies primarily on detecting the MSF prompt for command completion.
-
-    Args:
-        console: The Metasploit console object (MsfConsole).
-        cmd: The command to run.
-        execution_timeout: Optional specific timeout for this command's execution phase.
-
-    Returns:
-        The command output as a string.
-    """
-    if not (hasattr(console, 'write') and hasattr(console, 'read')):
-        logger.error(f"Console object {type(console)} lacks required methods (write, read).")
-        raise TypeError("Unsupported console object type for command execution.")
-
-    try:
-        logger.debug(f"Running console command: {cmd}")
-        write_start_time = asyncio.get_event_loop().time()
-        await asyncio.to_thread(lambda: console.write(cmd + '\n'))
-        write_duration = asyncio.get_event_loop().time() - write_start_time
-        logger.debug(f"Console write completed for '{cmd}' in {write_duration:.3f}s")
-
-        # For "set" commands, don't wait for console output as they produce none
-        if cmd.strip().startswith("set "):
-            logger.debug(f"Skipping console output wait for 'set' command: {cmd}")
-            return ""
-
-        output_buffer = b"" # Read as bytes to handle potential encoding issues and prompt matching
-        start_time = asyncio.get_event_loop().time()
-
-        # Determine read timeout - use inactivity timeout as fallback
-        read_timeout = execution_timeout or (LONG_CONSOLE_READ_TIMEOUT if cmd.strip().startswith(("run", "exploit", "check")) else DEFAULT_CONSOLE_READ_TIMEOUT)
-        check_interval = 0.1 # Seconds between reads
-        last_data_time = start_time
-
-        # Progress tracking for long-running commands
-        progress_interval = 10  # Log progress every 10 seconds
-        last_progress_time = start_time
-        total_chunks_read = 0
-        total_bytes_read = 0
-        timed_out = False  # Track if we exit due to timeout
-        
-        logger.info(f"Starting console command execution: '{cmd}' (timeout: {read_timeout}s)")
-        
-        while True:
-            await asyncio.sleep(check_interval)
-            current_time = asyncio.get_event_loop().time()
-            elapsed_time = current_time - start_time
-
-            # Progress logging for long-running operations
-            if (current_time - last_progress_time) >= progress_interval:
-                logger.info(f"Console command '{cmd}' still running... "
-                          f"Elapsed: {elapsed_time:.1f}s/{read_timeout}s, "
-                          f"Chunks read: {total_chunks_read}, "
-                          f"Bytes received: {total_bytes_read}, "
-                          f"Last activity: {current_time - last_data_time:.1f}s ago")
-                last_progress_time = current_time
-
-            # Check overall timeout first
-            if elapsed_time > read_timeout:
-                 logger.warning(f"Overall timeout ({read_timeout}s) reached for console command '{cmd}'. "
-                              f"Total chunks: {total_chunks_read}, bytes: {total_bytes_read}")
-                 timed_out = True
-                 break
-
-            # Read available data
-            try:
-                chunk_result = await asyncio.to_thread(lambda: console.read())
-                # console.read() returns {'data': '...', 'prompt': '...', 'busy': bool}
-                chunk_data = chunk_result.get('data', '').encode('utf-8', errors='replace') # Ensure bytes
-                is_busy = chunk_result.get('busy', False)
-
-                # Handle the prompt - ensure it's bytes for pattern matching
-                prompt_str = chunk_result.get('prompt', '')
-                prompt_bytes = prompt_str.encode('utf-8', errors='replace') if isinstance(prompt_str, str) else prompt_str
-                
-                # Enhanced debug logging for timeout analysis
-                if chunk_data or is_busy or prompt_str:
-                    logger.debug(f"Console read result for '{cmd}' at {elapsed_time:.1f}s: "
-                               f"data_len={len(chunk_data)}, busy={is_busy}, prompt='{prompt_str[:50]}...' if len(prompt_str) > 50 else prompt_str")
-                
-                # Log console busy state periodically
-                if is_busy and (current_time - last_progress_time) >= (progress_interval - 1):
-                    logger.debug(f"Console reports busy=True for command '{cmd}' at {elapsed_time:.1f}s")
-                    
-            except Exception as read_err:
-                logger.warning(f"Error reading from console during command '{cmd}' at {elapsed_time:.1f}s: {read_err}")
-                await asyncio.sleep(0.5) # Wait a bit before retrying or timing out
-                continue
-
-            if chunk_data:
-                chunk_size = len(chunk_data)
-                total_chunks_read += 1
-                total_bytes_read += chunk_size
-                
-                # Log first data received
-                if total_chunks_read == 1:
-                    logger.debug(f"First data received for '{cmd}' after {elapsed_time:.3f}s: {chunk_size} bytes")
-                
-                # Log significant data chunks
-                if chunk_size > 100:
-                    logger.debug(f"Received significant data chunk for '{cmd}': {chunk_size} bytes "
-                               f"(total: {total_bytes_read} bytes in {total_chunks_read} chunks)")
-                
-                output_buffer += chunk_data
-                last_data_time = current_time # Reset inactivity timer
-
-                # Primary Completion Check: Did we receive the prompt?
-                if prompt_bytes and MSF_PROMPT_RE.search(prompt_bytes):
-                     logger.info(f"Detected MSF prompt in console.read() result for '{cmd}' after {elapsed_time:.1f}s. Command complete.")
-                     break
-                # Secondary Check: Does the buffered output end with the prompt?
-                # Needed if prompt wasn't in the last read chunk but arrived earlier.
-                if MSF_PROMPT_RE.search(output_buffer):
-                     logger.info(f"Detected MSF prompt at end of buffer for '{cmd}' after {elapsed_time:.1f}s. Command complete.")
-                     break
-
-            # Fallback Completion Check: Inactivity timeout
-            elif (current_time - last_data_time) > SESSION_READ_INACTIVITY_TIMEOUT:
-                inactivity_duration = current_time - last_data_time
-                logger.info(f"Console inactivity timeout ({SESSION_READ_INACTIVITY_TIMEOUT}s) reached for command '{cmd}' "
-                          f"after {elapsed_time:.1f}s total. No data for {inactivity_duration:.1f}s. Assuming complete.")
-                break
-
-        # Decode the final buffer
-        final_output = output_buffer.decode('utf-8', errors='replace').strip()
-        total_execution_time = asyncio.get_event_loop().time() - start_time
-        
-        # Handle timeout vs normal completion
-        if timed_out:
-            logger.error(f"Console command '{cmd}' TIMED OUT after {total_execution_time:.1f}s (limit: {read_timeout}s). "
-                        f"Read {total_chunks_read} chunks, {total_bytes_read} bytes, "
-                        f"output length: {len(final_output)} chars")
-            logger.debug(f"Timeout output for '{cmd}' (length {len(final_output)}):\n{final_output[:500]}{'...' if len(final_output) > 500 else ''}")
-            return f"TIMEOUT_ERROR: Command '{cmd}' exceeded {read_timeout}s timeout after {total_execution_time:.1f}s. Output: {final_output}"
-        else:
-            logger.info(f"Console command '{cmd}' completed successfully in {total_execution_time:.1f}s. "
-                       f"Read {total_chunks_read} chunks, {total_bytes_read} bytes, "
-                       f"output length: {len(final_output)} chars")
-            logger.debug(f"Final output for '{cmd}' (length {len(final_output)}):\n{final_output[:500]}{'...' if len(final_output) > 500 else ''}")
-            return final_output
-
-    except Exception as e:
-        elapsed_time = asyncio.get_event_loop().time() - start_time
-        logger.exception(f"Error executing console command '{cmd}' after {elapsed_time:.1f}s. "
-                        f"Chunks read: {total_chunks_read}, bytes: {total_bytes_read}")
-        raise RuntimeError(f"Failed executing console command '{cmd}' after {elapsed_time:.1f}s: {e}") from e
-
 from mcp.server.session import ServerSession
 
 ####################################################################################
@@ -378,82 +181,6 @@ ServerSession._received_request = _received_request
 mcp = FastMCP("Metasploit Tools Enhanced (Streamlined)")
 
 # --- Internal Helper Functions ---
-
-def _parse_options_gracefully(options: Union[Dict[str, Any], str, None]) -> Dict[str, Any]:
-    """
-    Gracefully parse options from different formats.
-    
-    Handles:
-    - Dict format (correct): {"key": "value", "key2": "value2"}
-    - String format (common mistake): "key=value,key=value"
-    - None: returns empty dict
-    
-    Args:
-        options: Options in dict format, string format, or None
-        
-    Returns:
-        Dictionary of parsed options
-        
-    Raises:
-        ValueError: If string format is malformed
-    """
-    if options is None:
-        return {}
-    
-    if isinstance(options, dict):
-        # Already correct format
-        return options
-    
-    if isinstance(options, str):
-        # Handle the common mistake format: "key=value,key=value"
-        if not options.strip():
-            return {}
-            
-        logger.info(f"Converting string format options to dict: {options}")
-        parsed_options = {}
-        
-        try:
-            # Split by comma and then by equals
-            pairs = [pair.strip() for pair in options.split(',') if pair.strip()]
-            for pair in pairs:
-                if '=' not in pair:
-                    raise ValueError(f"Invalid option format: '{pair}' (missing '=')")
-                
-                key, value = pair.split('=', 1)  # Split only on first '='
-                key = key.strip()
-                value = value.strip()
-                
-                # Validate key is not empty
-                if not key:
-                    raise ValueError(f"Invalid option format: '{pair}' (empty key)")
-                
-                # Remove quotes if they wrap the entire value
-                if (value.startswith('"') and value.endswith('"')) or \
-                   (value.startswith("'") and value.endswith("'")):
-                    value = value[1:-1]
-                
-                # Basic type conversion
-                if value.lower() in ('true', 'false'):
-                    value = value.lower() == 'true'
-                elif value.isdigit():
-                    try:
-                        value = int(value)
-                    except ValueError:
-                        pass  # Keep as string if conversion fails
-                
-                parsed_options[key] = value
-            
-            logger.info(f"Successfully converted string options to dict: {parsed_options}")
-            return parsed_options
-            
-        except Exception as e:
-            raise ValueError(f"Failed to parse options string '{options}': {e}. Expected format: 'key=value,key2=value2' or dict {{'key': 'value'}}")
-    
-    # For any other type, try to convert to dict
-    try:
-        return dict(options)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"Options must be a dictionary or comma-separated string format 'key=value,key2=value2'. Got {type(options)}: {options}")
 
 async def _get_module_object(module_type: str, module_name: str) -> Any:
     """Gets the MSF module object, handling potential path variations."""
@@ -507,7 +234,26 @@ async def _set_module_options(module_obj: Any, options: Dict[str, Any]):
         except (MsfRpcError, KeyError, TypeError) as e:
              # Catch potential errors if option doesn't exist or type is wrong
              logger.error(f"Failed to set option {k}={v} on module: {e}")
-             raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}") from e
+             
+             # Check if this is an "Invalid option" error and include module options
+             error_msg = str(e).lower()
+             if "invalid option" in error_msg or "unknown option" in error_msg:
+                 try:
+                     # Get module options to help the user understand what's available
+                     module_options = await asyncio.to_thread(lambda: module_obj.options)
+                     module_name = getattr(module_obj, 'fullname', 'unknown')
+                     
+                     # Create enhanced error message with available options
+                     available_options = list(module_options.keys()) if module_options else []
+                     options_info = f"Available options for {module_name}: {', '.join(sorted(available_options))}" if available_options else f"No options available for {module_name}"
+                     
+                     raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}. {options_info}") from e
+                 except Exception as options_error:
+                     # If we can't get options, just raise the original error
+                     logger.warning(f"Could not retrieve module options for enhanced error message: {options_error}")
+                     raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}") from e
+             else:
+                 raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}") from e
 
 async def _execute_module_rpc(
     module_type: str,
@@ -741,12 +487,30 @@ async def _execute_module_console(
             for i, cmd in enumerate(setup_commands, 1):
                 logger.debug(f"Setup command {i}/{len(setup_commands)}: {cmd}")
                 setup_output = await run_command_safely(console, cmd, execution_timeout=DEFAULT_CONSOLE_READ_TIMEOUT)
+                logger.debug(f"Setup command {i} output: {setup_output}")
                 
                 # Basic error check in setup output
                 if any(err in setup_output for err in ["[-] Error setting", "Invalid option", "Unknown module", "Failed to load"]):
                     error_msg = f"Error during setup command '{cmd}': {setup_output}"
                     logger.error(error_msg)
-                    return {"status": "error", "message": error_msg, "module": full_module_path}
+                    
+                    # If this is an "Invalid option" error, try to get module options
+                    if "Invalid option" in setup_output or "Unknown option" in setup_output:
+                        try:
+                            # Get module options to help the user understand what's available
+                            module_obj = await _get_module_object(module_type, module_name)
+                            module_options = await asyncio.to_thread(lambda: module_obj.options)
+                            available_options = list(module_options.keys()) if module_options else []
+                            options_info = f"Available options for {full_module_path}: {', '.join(sorted(available_options))}" if available_options else f"No options available for {full_module_path}"
+                            
+                            enhanced_error_msg = f"{error_msg}. {options_info}"
+                            return {"status": "error", "message": enhanced_error_msg, "module": full_module_path}
+                        except Exception as options_error:
+                            # If we can't get options, just return the original error
+                            logger.warning(f"Could not retrieve module options for enhanced error message: {options_error}")
+                            return {"status": "error", "message": error_msg, "module": full_module_path}
+                    else:
+                        return {"status": "error", "message": error_msg, "module": full_module_path}
                 
                 logger.debug(f"Setup command {i} completed successfully")
                 await asyncio.sleep(0.1) # Small delay between setup commands
@@ -754,6 +518,14 @@ async def _execute_module_console(
             # Execute the final command (exploit, run, check)
             logger.info(f"Setup complete. Executing final command '{command}' for {full_module_path} "
                        f"(timeout: {timeout}s)")
+            logger.info(f"DEBUG: All setup commands executed: {setup_commands}")
+            
+            # Check console state before exploit
+            try:
+                pre_exploit_state = await run_command_safely(console, "show options", execution_timeout=5)
+                logger.info(f"DEBUG: Console state before exploit: {pre_exploit_state}")
+            except Exception as e:
+                logger.debug(f"Could not get pre-exploit state: {e}")
             
             start_execution_time = asyncio.get_event_loop().time()
             module_output = await run_command_safely(console, command, execution_timeout=timeout)
@@ -762,6 +534,7 @@ async def _execute_module_console(
             logger.info(f"Module execution completed in {execution_duration:.1f}s. "
                        f"Output length: {len(module_output)} characters")
             logger.debug(f"Module output preview: {module_output[:200]}{'...' if len(module_output) > 200 else ''}")
+            logger.info(f"FULL MODULE OUTPUT: {module_output}")
 
             # --- Parse Console Output ---
             session_id = None
@@ -923,6 +696,10 @@ async def generate_payload(
     Generate a Metasploit payload using the RPC API (payload.generate).
     Saves the generated payload to a file on the server if successful.
 
+    IMPORTANT: Before generating a payload, it's strongly recommended to use the 
+    'show_options' tool to check the available options for the payload. This helps 
+    ensure you provide the correct option names and avoid "Invalid option" errors.
+
     Args:
         payload_type: Type of payload (e.g., windows/meterpreter/reverse_tcp).
         format_type: Output format (raw, exe, python, etc.).
@@ -943,13 +720,18 @@ async def generate_payload(
 
     Returns:
         Dictionary containing status, message, payload size/info, and server-side save path.
+        
+    Example workflow:
+        1. Use 'show_options' to check available payload options
+        2. Configure the payload with proper options based on the output
+        3. Generate the payload with 'generate_payload'
     """
     client = get_msf_client()
     logger.info(f"Generating payload '{payload_type}' (Format: {format_type}) via RPC. Options: {options}")
 
     # Parse options gracefully
     try:
-        parsed_options = _parse_options_gracefully(options)
+        parsed_options = parse_options_gracefully(options)
     except ValueError as e:
         return {"status": "error", "message": f"Invalid options format: {e}"}
 
@@ -1106,6 +888,11 @@ async def run_exploit(
     Run a Metasploit exploit module with specified options. Handles async (job)
     and sync (console) execution, and includes session polling for jobs.
 
+    IMPORTANT: Before running an exploit, it's strongly recommended to use the 
+    'show_options' tool to check the available options for both the module and 
+    payload. This helps ensure you provide the correct option names and avoid 
+    "Invalid option" errors.
+
     Args:
         module_name: Name/path of the exploit module (e.g., 'unix/ftp/vsftpd_234_backdoor').
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
@@ -1118,12 +905,17 @@ async def run_exploit(
 
     Returns:
         Dictionary with execution results (job_id, session_id, output) or error details.
+        
+    Example workflow:
+        1. Use 'show_options' to check available module and payload options
+        2. Configure the exploit with proper options based on the output
+        3. Run the exploit with 'run_exploit'
     """
     logger.info(f"Request to run exploit '{module_name}'. Job: {run_as_job}, Check: {check_vulnerability}, Payload: {payload_name}")
 
     # Parse payload options gracefully
     try:
-        parsed_payload_options = _parse_options_gracefully(payload_options)
+        parsed_payload_options = parse_options_gracefully(payload_options)
     except ValueError as e:
         return {"status": "error", "message": f"Invalid payload_options format: {e}"}
 
@@ -1135,7 +927,7 @@ async def run_exploit(
         logger.info(f"Performing vulnerability check first for {module_name}...")
         try:
              # Use the console helper for 'check' as it provides output
-             check_result = await _execute_module_console(
+             check_result = await execute_module_console(
                  module_type='exploit',
                  module_name=module_name,
                  module_options=options,
@@ -1170,7 +962,7 @@ async def run_exploit(
     
     if run_as_job:
         logger.info(f"Executing exploit '{module_name}' as background job via RPC")
-        result = await _execute_module_rpc(
+        result = await execute_module_rpc(
             module_type='exploit',
             module_name=module_name,
             module_options=options,
@@ -1178,7 +970,7 @@ async def run_exploit(
         )
     else:
         logger.info(f"Executing exploit '{module_name}' synchronously via console (timeout: {timeout_seconds}s)")
-        result = await _execute_module_console(
+        result = await execute_module_console(
             module_type='exploit',
             module_name=module_name,
             module_options=options,
@@ -1203,6 +995,10 @@ async def run_post_module(
     """
     Run a Metasploit post-exploitation module against a session.
 
+    IMPORTANT: Before running a post module, it's strongly recommended to use the 
+    'show_options' tool to check the available options for the module. This helps 
+    ensure you provide the correct option names and avoid "Invalid option" errors.
+
     Args:
         module_name: Name/path of the post module (e.g., 'windows/gather/enum_shares').
         session_id: The ID of the target session.
@@ -1212,6 +1008,11 @@ async def run_post_module(
 
     Returns:
         Dictionary with execution results or error details.
+        
+    Example workflow:
+        1. Use 'show_options' to check available module options
+        2. Configure the module with proper options based on the output
+        3. Run the module with 'run_post_module'
     """
     logger.info(f"Request to run post module {module_name} on session {session_id}. Job: {run_as_job}")
     module_options = options or {}
@@ -1231,14 +1032,14 @@ async def run_post_module(
 
 
     if run_as_job:
-        return await _execute_module_rpc(
+        return await execute_module_rpc(
             module_type='post',
             module_name=module_name,
             module_options=module_options
             # No payload for post modules
         )
     else:
-        return await _execute_module_console(
+        return await execute_module_console(
             module_type='post',
             module_name=module_name,
             module_options=module_options,
@@ -1257,6 +1058,10 @@ async def run_auxiliary_module(
     """
     Run a Metasploit auxiliary module.
 
+    IMPORTANT: Before running an auxiliary module, it's strongly recommended to use 
+    the 'show_options' tool to check the available options for the module. This helps 
+    ensure you provide the correct option names and avoid "Invalid option" errors.
+
     Args:
         module_name: Name/path of the auxiliary module (e.g., 'scanner/ssh/ssh_login').
         options: Dictionary of module options (e.g., {'RHOSTS': ..., 'USERNAME': ...}).
@@ -1266,6 +1071,11 @@ async def run_auxiliary_module(
 
     Returns:
         Dictionary with execution results or error details.
+        
+    Example workflow:
+        1. Use 'show_options' to check available module options
+        2. Configure the module with proper options based on the output
+        3. Run the module with 'run_auxiliary_module'
     """
     logger.info(f"Request to run auxiliary module {module_name}. Job: {run_as_job}, Check: {check_target}")
     module_options = options or {}
@@ -1274,7 +1084,7 @@ async def run_auxiliary_module(
         logger.info(f"Performing check first for auxiliary module {module_name}...")
         try:
              # Use the console helper for 'check'
-             check_result = await _execute_module_console(
+             check_result = await execute_module_console(
                  module_type='auxiliary',
                  module_name=module_name,
                  module_options=options,
@@ -1299,14 +1109,14 @@ async def run_auxiliary_module(
              logger.warning(f"Check failed for auxiliary {module_name}: {chk_e}. Proceeding with run attempt.")
 
     if run_as_job:
-        return await _execute_module_rpc(
+        return await execute_module_rpc(
             module_type='auxiliary',
             module_name=module_name,
             module_options=module_options
             # No payload for aux modules
         )
     else:
-        return await _execute_module_console(
+        return await execute_module_console(
             module_type='auxiliary',
             module_name=module_name,
             module_options=module_options,
@@ -1547,7 +1357,7 @@ async def send_session_command(
                     elif (now - last_data_time) > SESSION_READ_INACTIVITY_TIMEOUT:
                          logger.debug(f"Shell inactivity timeout ({SESSION_READ_INACTIVITY_TIMEOUT}s) reached for command '{command}'. Assuming complete.")
                          status = "success" # Assume success if inactive after sending command
-                         message = "Shell command likely completed (inactivity)."
+                         message = "Shell command possibly completed (inactivity). If you expected output, and there is none, the command likely failed."
                          break
 
                     await asyncio.sleep(read_interval)
@@ -1665,6 +1475,10 @@ async def start_listener(
     """
     Start a new Metasploit handler (exploit/multi/handler) as a background job.
 
+    IMPORTANT: Before starting a listener, it's strongly recommended to use the 
+    'show_options' tool to check the available options for the payload. This helps 
+    ensure you provide the correct option names and avoid "Invalid option" errors.
+
     Args:
         payload_type: The payload to handle (e.g., 'windows/meterpreter/reverse_tcp').
         lhost: Listener host address (what the target connects to).
@@ -1679,6 +1493,11 @@ async def start_listener(
 
     Returns:
         Dictionary with handler status (job_id) or error details.
+        
+    Example workflow:
+        1. Use 'show_options' to check available payload options
+        2. Configure the listener with proper options based on the output
+        3. Start the listener with 'start_listener'
     """
     # Set defaults for bind address and port
     bind_address = reverse_listener_bind_address if reverse_listener_bind_address is not None else "0.0.0.0"
@@ -1700,7 +1519,7 @@ async def start_listener(
 
     # Parse additional options gracefully
     try:
-        parsed_additional_options = _parse_options_gracefully(additional_options)
+        parsed_additional_options = parse_options_gracefully(additional_options)
     except ValueError as e:
         return {"status": "error", "message": f"Invalid additional_options format: {e}"}
 
@@ -1721,7 +1540,7 @@ async def start_listener(
     payload_spec = {"name": payload_type, "options": payload_options}
 
     # Use the RPC helper to start the handler job
-    result = await _execute_module_rpc(
+    result = await execute_module_rpc(
         module_type='exploit',
         module_name='multi/handler', # Use base name for helper
         module_options=module_options,
@@ -1840,6 +1659,31 @@ async def terminate_session(session_id: int) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(f"Unexpected error terminating session {session_id}")
         return {"status": "error", "message": f"Unexpected error terminating session {session_id}: {e}"}
+
+# --- Show Options Tool ---
+
+@mcp.tool()
+async def show_options(
+    module_name: str,
+    module_type: str = "exploit",
+    payload_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Show available options for a Metasploit module and/or payload in the same format
+    as the msfconsole 'show options' command.
+    
+    Args:
+        module_name: Name/path of the module (e.g., 'unix/webapp/php_eval').
+        module_type: Type of module ('exploit', 'auxiliary', 'post', 'payload').
+        payload_name: Optional payload name to show options for.
+    
+    Returns:
+        Dictionary with formatted options output similar to msfconsole.
+    """
+    logger.info(f"Request to show options for {module_type} module '{module_name}'" + 
+                (f" and payload '{payload_name}'" if payload_name else ""))
+    
+    return await show_module_options_via_console(module_name, module_type, payload_name)
 
 # --- Health Check Tool ---
 # Add health check as an MCP tool instead of a separate endpoint
